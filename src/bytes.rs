@@ -122,6 +122,8 @@ pub(crate) struct Vtable {
     pub is_unique: unsafe fn(&AtomicPtr<()>) -> bool,
     /// fn(data, ptr, len)
     pub drop: unsafe fn(*mut (), *const u8, usize),
+    /// fn(data, ptr, len)
+    pub allocation_size_hint: unsafe fn(&AtomicPtr<()>, *const u8, usize) -> Option<usize>,
 }
 
 impl Bytes {
@@ -341,6 +343,33 @@ impl Bytes {
     /// ```
     pub fn is_unique(&self) -> bool {
         unsafe { (self.vtable.is_unique)(&self.data) }
+    }
+
+    /// Returns the size of the allocation backing this `Bytes`, or `None` if
+    /// `bytes` doesn't manage the memory (static and
+    /// [`from_owner`](Self::from_owner) buffers).
+    ///
+    /// The allocation is kept alive as long as any handle to it is, so this
+    /// can be much more than [`len`](Self::len), e.g. for a small slice of a
+    /// large buffer. Handles that share an allocation each report all of it.
+    /// It is a hint because it is the size requested from the allocator,
+    /// which may round it up.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::{Bytes, BytesMut};
+    ///
+    /// let mut buf = BytesMut::with_capacity(1024);
+    /// buf.extend_from_slice(&[0; 100]);
+    /// let a = buf.split_to(10).freeze();
+    /// assert_eq!(a.len(), 10);
+    /// assert_eq!(a.allocation_size_hint(), Some(1024));
+    ///
+    /// assert_eq!(Bytes::from_static(b"hello").allocation_size_hint(), None);
+    /// ```
+    pub fn allocation_size_hint(&self) -> Option<usize> {
+        unsafe { (self.vtable.allocation_size_hint)(&self.data, self.ptr, self.len) }
     }
 
     /// Creates `Bytes` instance from slice, by copying it.
@@ -1068,6 +1097,7 @@ const STATIC_VTABLE: Vtable = Vtable {
     into_mut: static_to_mut,
     is_unique: static_is_unique,
     drop: static_drop,
+    allocation_size_hint: no_allocation_size_hint,
 };
 
 unsafe fn static_clone(_: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
@@ -1093,6 +1123,11 @@ unsafe fn static_drop(_: *mut (), _: *const u8, _: usize) {
     // nothing to drop for &'static [u8]
 }
 
+/// For memory `bytes` doesn't allocate: `&'static [u8]` and opaque owners.
+unsafe fn no_allocation_size_hint(_: &AtomicPtr<()>, _: *const u8, _: usize) -> Option<usize> {
+    None
+}
+
 // ===== impl OwnedVtable =====
 
 #[repr(C)]
@@ -1108,6 +1143,7 @@ impl<T> Owned<T> {
         into_mut: owned_to_mut::<T>,
         is_unique: owned_is_unique,
         drop: owned_drop::<T>,
+        allocation_size_hint: no_allocation_size_hint,
     };
 }
 
@@ -1171,6 +1207,7 @@ static PROMOTABLE_EVEN_VTABLE: Vtable = Vtable {
     into_mut: promotable_even_to_mut,
     is_unique: promotable_is_unique,
     drop: promotable_even_drop,
+    allocation_size_hint: promotable_even_allocation_size_hint,
 };
 
 static PROMOTABLE_ODD_VTABLE: Vtable = Vtable {
@@ -1179,6 +1216,7 @@ static PROMOTABLE_ODD_VTABLE: Vtable = Vtable {
     into_mut: promotable_odd_to_mut,
     is_unique: promotable_is_unique,
     drop: promotable_odd_drop,
+    allocation_size_hint: promotable_odd_allocation_size_hint,
 };
 
 unsafe fn promotable_even_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
@@ -1271,6 +1309,23 @@ unsafe fn promotable_even_drop(shared: *mut (), ptr: *const u8, len: usize) {
     }
 }
 
+unsafe fn promotable_even_allocation_size_hint(
+    data: &AtomicPtr<()>,
+    ptr: *const u8,
+    len: usize,
+) -> Option<usize> {
+    let shared = data.load(Ordering::Acquire);
+    let kind = shared as usize & KIND_MASK;
+
+    if kind == KIND_ARC {
+        Some((*shared.cast::<Shared>()).cap)
+    } else {
+        debug_assert_eq!(kind, KIND_VEC);
+        let buf = ptr_map(shared.cast(), |addr| addr & !KIND_MASK);
+        Some(boxed_slice_cap(buf, ptr, len))
+    }
+}
+
 unsafe fn promotable_odd_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
     let shared = data.load(Ordering::Acquire);
     let kind = shared as usize & KIND_MASK;
@@ -1303,6 +1358,22 @@ unsafe fn promotable_odd_drop(shared: *mut (), ptr: *const u8, len: usize) {
     }
 }
 
+unsafe fn promotable_odd_allocation_size_hint(
+    data: &AtomicPtr<()>,
+    ptr: *const u8,
+    len: usize,
+) -> Option<usize> {
+    let shared = data.load(Ordering::Acquire);
+    let kind = shared as usize & KIND_MASK;
+
+    if kind == KIND_ARC {
+        Some((*shared.cast::<Shared>()).cap)
+    } else {
+        debug_assert_eq!(kind, KIND_VEC);
+        Some(boxed_slice_cap(shared.cast(), ptr, len))
+    }
+}
+
 unsafe fn promotable_is_unique(data: &AtomicPtr<()>) -> bool {
     let shared = data.load(Ordering::Acquire);
     let kind = shared as usize & KIND_MASK;
@@ -1318,6 +1389,13 @@ unsafe fn promotable_is_unique(data: &AtomicPtr<()>) -> bool {
 unsafe fn free_boxed_slice(buf: *mut u8, offset: *const u8, len: usize) {
     let cap = offset.offset_from(buf) as usize + len;
     dealloc(buf, Layout::from_size_align(cap, 1).unwrap())
+}
+
+/// Until promoted, a promotable `Bytes` always ends where its boxed slice does
+/// (truncating one promotes it first), the same invariant `free_boxed_slice`
+/// relies on.
+unsafe fn boxed_slice_cap(buf: *mut u8, offset: *const u8, len: usize) -> usize {
+    offset.offset_from(buf) as usize + len
 }
 
 // ===== impl SharedVtable =====
@@ -1356,6 +1434,7 @@ static SHARED_VTABLE: Vtable = Vtable {
     into_mut: shared_to_mut,
     is_unique: shared_is_unique,
     drop: shared_drop,
+    allocation_size_hint: shared_allocation_size_hint,
 };
 
 const KIND_ARC: usize = 0b0;
@@ -1447,6 +1526,16 @@ pub(crate) unsafe fn shared_is_unique(data: &AtomicPtr<()>) -> bool {
 
 unsafe fn shared_drop(shared: *mut (), _ptr: *const u8, _len: usize) {
     release_shared(shared.cast());
+}
+
+unsafe fn shared_allocation_size_hint(
+    data: &AtomicPtr<()>,
+    _ptr: *const u8,
+    _len: usize,
+) -> Option<usize> {
+    // `cap` is fixed for the `Shared`'s lifetime, which the caller's handle extends.
+    let shared = data.load(Ordering::Relaxed);
+    Some((*shared.cast::<Shared>()).cap)
 }
 
 unsafe fn shallow_clone_arc(shared: *mut Shared, ptr: *const u8, len: usize) -> Bytes {

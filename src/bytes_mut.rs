@@ -1890,6 +1890,7 @@ static SHARED_VTABLE: Vtable = Vtable {
     into_mut: shared_v_to_mut,
     is_unique: shared_v_is_unique,
     drop: shared_v_drop,
+    allocation_size_hint: shared_v_allocation_size_hint,
 };
 
 unsafe fn shared_v_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
@@ -1959,6 +1960,17 @@ unsafe fn shared_v_is_unique(data: &AtomicPtr<()>) -> bool {
 
 unsafe fn shared_v_drop(shared: *mut (), _ptr: *const u8, _len: usize) {
     release_shared(shared.cast());
+}
+
+unsafe fn shared_v_allocation_size_hint(
+    data: &AtomicPtr<()>,
+    _ptr: *const u8,
+    _len: usize,
+) -> Option<usize> {
+    // The vec is only reallocated or reclaimed while its buffer is uniquely
+    // owned, which it is not while the caller's handle references it.
+    let shared = data.load(Ordering::Relaxed);
+    Some((*shared.cast::<Shared>()).vec.capacity())
 }
 
 // compile-fails
